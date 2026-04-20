@@ -1,0 +1,16 @@
+{
+  "name": "langua-token-research",
+  "version": "1.0.0",
+  "description": "Simulation of context management strategies for Langua chat token usage analysis",
+  "main": "src/simulate.js",
+  "type": "commonjs",
+  "scripts": {
+    "simulate": "node src/simulate.js",
+    "analyze": "node src/analyze.js",
+    "run-all": "node src/simulate.js && node src/analyze.js"
+  },
+  "dependencies": {
+    "tiktoken": "^1.0.15",
+    "chalk": "^4.1.2"
+  }
+}
