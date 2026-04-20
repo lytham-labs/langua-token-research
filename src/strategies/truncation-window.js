@@ -1,58 +1,42 @@
 /**
  * truncation-window.js
  * Sliding window truncation strategy.
- *
- * Behavior: Keep system prompt + the last N messages (configurable).
- * No summarization — older messages are simply discarded.
- *
- * Configurations tested: N = 4, 8, 12, 20, 40
- *
- * Token cost per turn: grows until N messages are in history, then plateaus.
- * Context quality: moderate — recent history preserved but older context lost.
+ * Uses incremental token counting for O(n) performance.
  */
 
-const { countMessages } = require('../tokenizer');
+const { countTokens, precomputeMessageTokens } = require('../tokenizer');
 
 const STRATEGY_NAME = 'truncation-window';
 
-/**
- * Simulate the sliding window strategy.
- *
- * @param {string} systemPrompt
- * @param {Array<{role: string, content: string}>} allMessages
- * @param {{ windowSize: number }} config
- * @returns {{
- *   strategyName: string,
- *   tokensPerTurn: number[],
- *   totalTokens: number,
- *   cumulativeTokensByTurn: number[],
- *   config: object
- * }}
- */
 function simulate(systemPrompt, allMessages, config = {}) {
   const windowSize = config.windowSize || 20;
+  const numTurns = Math.floor(allMessages.length / 2);
+
+  const msgTokens = precomputeMessageTokens(allMessages);
+  const systemPromptTokens = countTokens(systemPrompt);
+
+  const cumMsg = new Array(msgTokens.length + 1).fill(0);
+  for (let i = 0; i < msgTokens.length; i++) {
+    cumMsg[i + 1] = cumMsg[i] + msgTokens[i];
+  }
+
+  const BASE_OVERHEAD = 3;
   const tokensPerTurn = [];
   let totalTokens = 0;
 
-  const numTurns = Math.floor(allMessages.length / 2);
-
   for (let turn = 0; turn < numTurns; turn++) {
-    // History includes all messages up to (but not including) current user msg
-    // Current user msg is at allMessages[turn * 2]
-    const historyMessages = allMessages.slice(0, turn * 2);
-    const currentUserMessage = allMessages[turn * 2];
+    const historyMsgCount = turn * 2;
+    const currentMsgIdx = turn * 2;
 
-    // Sliding window: take the last `windowSize - 1` history messages
-    // (leave room for the new user message)
-    const windowedHistory = historyMessages.slice(-(windowSize - 1));
+    // Last (windowSize - 1) history messages
+    const windowStart = Math.max(0, historyMsgCount - (windowSize - 1));
+    const windowTokens = (cumMsg[historyMsgCount] - cumMsg[windowStart]);
 
-    const contextMessages = [
-      { role: 'system', content: systemPrompt },
-      ...windowedHistory,
-      currentUserMessage,
-    ];
+    const turnTokens = (4 + systemPromptTokens) +
+      windowTokens +
+      msgTokens[currentMsgIdx] +
+      BASE_OVERHEAD;
 
-    const turnTokens = countMessages(contextMessages);
     tokensPerTurn.push(turnTokens);
     totalTokens += turnTokens;
   }
@@ -76,9 +60,6 @@ function simulate(systemPrompt, allMessages, config = {}) {
   };
 }
 
-/**
- * Run simulation with multiple window sizes.
- */
 function simulateAllWindows(systemPrompt, allMessages) {
   const windowSizes = [4, 8, 12, 20, 40];
   return windowSizes.map(size => simulate(systemPrompt, allMessages, { windowSize: size }));

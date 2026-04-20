@@ -7,6 +7,7 @@
  *   generateSystemPrompt() -> string
  *   generateSummary(conversationMessages, summaryStyle) -> string
  *   generateMixedConversation(numTurns, styleWeights) -> { messages, systemPrompt }
+ *   generateRealisticLanguaConversation(numTurns) -> { messages, systemPrompt }
  */
 
 const { countTokens, countMessages } = require('./tokenizer');
@@ -51,10 +52,10 @@ const ASSISTANT_RESPONSES_SHORT = [
 ];
 
 const ASSISTANT_RESPONSES_MEDIUM = [
-  'Great question! The subjunctive mood in Spanish is used to express subjective opinions, emotions, doubts, wishes, and hypothetical situations. The key trigger words are phrases like "espero que" (I hope that) and "quiero que" (I want that). When you see these phrases, the following verb must be conjugated in the subjunctive. For example: "Espero que tú vengas" means "I hope that you come," where "vengas" is the subjunctive form of "venir."',
-  'The difference between "ser" and "estar" is one of the most important distinctions in Spanish. "Ser" is used for permanent or inherent characteristics: nationality, profession, and physical traits that do not change. "Estar" is used for temporary states: emotions, location, and conditions that can change. For instance, "Soy alto" means "I am tall" (permanent), while "Estoy cansado" means "I am tired" (temporary state).',
-  'Reflexive verbs in Spanish are verbs where the subject performs an action on itself. They are always used with reflexive pronouns: me, te, se, nos, os, se. For example, "levantarse" means "to get up." Conjugated: "yo me levanto" (I get up), "tú te levantas" (you get up). The reflexive pronoun must agree with the subject in all cases. Common reflexive verbs include: llamarse, despertarse, vestirse, and ducharse.',
-  'The present perfect tense in Spanish is formed with the auxiliary verb "haber" plus the past participle. The conjugations of haber are: he, has, ha, hemos, habéis, han. The past participle for -ar verbs ends in -ado, and for -er/-ir verbs it ends in -ido. So "I have spoken" becomes "he hablado," and "she has eaten" becomes "ella ha comido." This tense is used to describe recently completed actions or actions with relevance to the present.',
+  'Great question! The subjunctive mood in Spanish is used to express subjective opinions, emotions, doubts, wishes, and hypothetical situations. The key trigger words are phrases like \"espero que\" (I hope that) and \"quiero que\" (I want that). When you see these phrases, the following verb must be conjugated in the subjunctive. For example: \"Espero que tú vengas\" means \"I hope that you come,\" where \"vengas\" is the subjunctive form of \"venir.\"',
+  'The difference between \"ser\" and \"estar\" is one of the most important distinctions in Spanish. \"Ser\" is used for permanent or inherent characteristics: nationality, profession, and physical traits that do not change. \"Estar\" is used for temporary states: emotions, location, and conditions that can change. For instance, \"Soy alto\" means \"I am tall\" (permanent), while \"Estoy cansado\" means \"I am tired\" (temporary state).',
+  'Reflexive verbs in Spanish are verbs where the subject performs an action on itself. They are always used with reflexive pronouns: me, te, se, nos, os, se. For example, \"levantarse\" means \"to get up.\" Conjugated: \"yo me levanto\" (I get up), \"tú te levantas\" (you get up). The reflexive pronoun must agree with the subject in all cases. Common reflexive verbs include: llamarse, despertarse, vestirse, and ducharse.',
+  'The present perfect tense in Spanish is formed with the auxiliary verb \"haber\" plus the past participle. The conjugations of haber are: he, has, ha, hemos, habéis, han. The past participle for -ar verbs ends in -ado, and for -er/-ir verbs it ends in -ido. So \"I have spoken\" becomes \"he hablado,\" and \"she has eaten\" becomes \"ella ha comido.\" This tense is used to describe recently completed actions or actions with relevance to the present.',
 ];
 
 const ASSISTANT_RESPONSES_LONG = [
@@ -108,6 +109,7 @@ Would you like practice exercises for any of these patterns?`,
 
 // ─── System Prompt Generator ───────────────────────────────────────────────
 
+// Realistic Langua system prompt ~380-420 tokens (verified with tiktoken)
 const SYSTEM_PROMPT_TEMPLATE = `You are Langua, an expert AI language tutor specializing in personalized, adaptive language instruction. Your primary goal is to help learners achieve fluency through structured practice, clear explanations, and encouraging feedback.
 
 TEACHING PHILOSOPHY:
@@ -134,7 +136,7 @@ ASSESSMENT AND FEEDBACK:
 Provide specific, actionable feedback. Instead of saying "that's wrong," explain why it's incorrect and provide the correct form with a mnemonic or pattern the learner can apply going forward.`;
 
 /**
- * Generate a realistic system prompt (approximately 300-500 tokens).
+ * Generate a realistic system prompt (~380-420 tokens).
  * @returns {string}
  */
 function generateSystemPrompt() {
@@ -246,6 +248,19 @@ function generateConversation(numTurns, messageStyle) {
 }
 
 /**
+ * Generate a realistic Langua conversation.
+ * Profile: 70% short (15-30 words), 20% medium (40-80 words), 10% long (100-200 words)
+ * System prompt: ~380-420 tokens (Langua tutor persona)
+ * Can run up to 120 turns (past the 100-message / turn-50 first summary trigger)
+ *
+ * @param {number} numTurns - Number of turn pairs (default: 120 to cover full range)
+ * @returns {{ messages: Array, systemPrompt: string, conversationTokens: number }}
+ */
+function generateRealisticLanguaConversation(numTurns = 120) {
+  return generateMixedConversation(numTurns, { short: 0.70, medium: 0.20, long: 0.10 });
+}
+
+/**
  * Generate a mixed-style conversation (weighted random per turn).
  *
  * @param {number} numTurns
@@ -279,7 +294,8 @@ function generateMixedConversation(numTurns, styleWeights = { short: 0.7, medium
     messages.push({ role: 'assistant', content: assistantContent });
   }
 
-  return { messages, systemPrompt };
+  const conversationTokens = countMessages(messages);
+  return { messages, systemPrompt, conversationTokens };
 }
 
 /**
@@ -307,9 +323,6 @@ function generateSummary(conversationMessages, summaryStyle = 'compact') {
   const summaryText = summaryIntro + summaryBody;
   const actualTokens = countTokens(summaryText);
 
-  // Pad or trim to approximate target
-  // For simulation purposes, we compute the expected tokens and just return
-  // the text with its real token count (close enough for modeling purposes)
   return {
     text: summaryText,
     tokens: actualTokens,
@@ -321,6 +334,7 @@ function generateSummary(conversationMessages, summaryStyle = 'compact') {
 module.exports = {
   generateConversation,
   generateMixedConversation,
+  generateRealisticLanguaConversation,
   generateSystemPrompt,
   generateSummary,
 };

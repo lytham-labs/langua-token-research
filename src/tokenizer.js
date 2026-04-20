@@ -50,4 +50,33 @@ function countMessages(messages) {
   return total;
 }
 
-module.exports = { countTokens, countMessages };
+/**
+ * Count tokens for a single message (without the trailing priming tokens).
+ * Useful for precomputing per-message costs.
+ * @param {{ role: string, content: string }} msg
+ * @returns {number}
+ */
+function countSingleMessage(msg) {
+  const encoder = getEncoder();
+  let total = 4; // overhead
+  if (msg.role) total += encoder.encode(msg.role).length;
+  if (msg.content) total += encoder.encode(msg.content).length;
+  return total;
+}
+
+/**
+ * Precompute token counts for each message in an array.
+ * Returns an array of per-message token counts (including 4-token overhead each).
+ * The 3-token priming overhead is NOT included (add it separately when needed).
+ *
+ * This is the performance-optimized path for strategy simulations.
+ * Precompute once, then use incremental sums instead of re-encoding full arrays.
+ *
+ * @param {Array<{role: string, content: string}>} messages
+ * @returns {number[]}
+ */
+function precomputeMessageTokens(messages) {
+  return messages.map(msg => countSingleMessage(msg));
+}
+
+module.exports = { countTokens, countMessages, countSingleMessage, precomputeMessageTokens };

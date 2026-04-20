@@ -1,101 +1,145 @@
 /**
  * summarization-current.js
- * Current Langua summarization strategy.
+ * REAL Langua summarization strategy — modeled from actual codebase constants.
  *
- * Behavior:
- *   - System prompt (first system message)
- *   - Summary injected as second system message: "Previous conversation summary:\n<text>"
- *   - Last 40 messages from conversation history
- *   - New user message
+ * REAL RAILS constants (Stream::ConversationSummarizationService):
+ *   MINIMUM_MESSAGES_FOR_FIRST_SUMMARY = 100  (individual messages = 50 turn pairs)
+ *   MESSAGES_INCREMENT_FOR_RESUMMARY   = 30   (individual messages = 15 turns)
+ *   MESSAGES_TO_KEEP_UNSUMMARIZED      = 30   (individual messages = 15 turns kept verbatim)
+ *   MAX_SUMMARY_WORDS = 500 (in prompt, not enforced)
+ *   MAX_SUMMARY_CHARS = 3000 (hard post-hoc truncation)
+ *   max_tokens: 800 (AI output limit for summarization call)
+ *   System prompt for summarization: ~500 tokens
  *
- * Key behaviors modeled:
- *   1. Summary is generated ONCE after a trigger turn (configurable: 10, 20, 30)
- *   2. Summary is FIXED SIZE — reused on every subsequent turn without regeneration
- *   3. The one-time summarization API call cost is added to total cost
- *   4. Before the trigger: ALL messages are included (unbounded — the current bug)
- *   5. After the trigger: summary + last 40 msgs (bounded)
+ * REAL WORKER constants (langua-chat-worker):
+ *   KEEP_RECENT_MESSAGES = 40 (after summary exists)
+ *   MAX_TOKENS = 30000 (roughToken gate)
+ *   No-summary path: sends ALL historical messages (unbounded bug)
  *
- * The "no summary path" bug:
- *   If the user never triggers summarization, ALL messages accumulate forever.
- *   This is modeled by the `withoutSummary` variant.
+ * KEY INSIGHT:
+ *   - 100 individual messages = 50 user+assistant turn pairs
+ *   - Turns 1–49 have NO summary: all history sent unbounded
+ *   - Most real conversations never reach turn 50
+ *
+ * RE-SUMMARIZATION:
+ *   - After first summary at turn 50: re-summarize at turns 65, 80, 95, ...
+ *   - Re-summarization passes ENTIRE older block (growing) + old summary
  */
 
-const { countMessages, countTokens } = require('../tokenizer');
+const { countMessages, countTokens, precomputeMessageTokens } = require('../tokenizer');
 
-const STRATEGY_NAME = 'summarization-current';
-const KEEP_RECENT_MESSAGES = 40;
+const STRATEGY_NAME = 'summarization-current-real';
+
+// ─── Real Constants ──────────────────────────────────────────────────────────
+
+const MINIMUM_MESSAGES_FOR_FIRST_SUMMARY = 100;
+const FIRST_SUMMARY_TRIGGER_TURN = MINIMUM_MESSAGES_FOR_FIRST_SUMMARY / 2; // = 50
+
+const MESSAGES_INCREMENT_FOR_RESUMMARY = 30;
+const RESUMMARY_TURN_INCREMENT = MESSAGES_INCREMENT_FOR_RESUMMARY / 2; // = 15
+
+const MESSAGES_TO_KEEP_UNSUMMARIZED = 30;
+const TURNS_TO_KEEP_UNSUMMARIZED = MESSAGES_TO_KEEP_UNSUMMARIZED / 2; // = 15
+
+const KEEP_RECENT_MESSAGES = 40; // individual messages
+
+const SUMMARIZATION_SYSTEM_PROMPT_TOKENS = 500;
 
 /**
- * Simulate the current Langua strategy WITH summary triggered at a specific turn.
- *
- * @param {string} systemPrompt
- * @param {Array<{role: string, content: string}>} allMessages
- * @param {{
- *   triggerTurn: number,         // Turn number when summary is generated (default: 20)
- *   summaryTokens: number,       // Pre-computed summary token size
- *   summaryText: string,         // The actual summary text
- *   summaryStyle: string         // 'compact' or 'verbose'
- * }} config
+ * Simulate the REAL Langua strategy with accurate constants.
+ * Uses precomputed per-message token counts for O(n) performance instead of O(n²).
  */
 function simulate(systemPrompt, allMessages, config = {}) {
-  const triggerTurn = config.triggerTurn || 20;
-  const summaryTokens = config.summaryTokens || 800;
-  const summaryText = config.summaryText || 'Previous conversation summary: ' + 'x'.repeat(100);
-  const summaryStyle = config.summaryStyle || 'compact';
+  const summaryTokens = config.summaryTokens || 500;
+  const summaryText = config.summaryText || generateFixedSummaryText(summaryTokens);
+
+  const numTurns = Math.floor(allMessages.length / 2);
+
+  // Precompute token costs for each individual message
+  const msgTokens = precomputeMessageTokens(allMessages);
+  const systemPromptTokens = countTokens(systemPrompt);
+  const summaryMsgTokens = 4 + countTokens('system') + countTokens(`Previous conversation summary:\n${summaryText}`);
+
+  // Compute cumulative message token sums for O(1) range queries
+  // cumMsg[i] = sum of msgTokens[0..i-1]
+  const cumMsg = new Array(msgTokens.length + 1).fill(0);
+  for (let i = 0; i < msgTokens.length; i++) {
+    cumMsg[i + 1] = cumMsg[i] + msgTokens[i];
+  }
+
+  // Helper: tokens for messages[startIdx..endIdx-1] (slice)
+  function rangeTokens(startIdx, endIdx) {
+    return cumMsg[endIdx] - cumMsg[startIdx];
+  }
 
   const tokensPerTurn = [];
   let totalTokens = 0;
-  let summaryCallCost = 0;
+  let totalSummaryCallCost = 0;
 
-  const numTurns = Math.floor(allMessages.length / 2);
-  let summaryGenerated = false;
+  let currentSummaryText = null;
+  let currentSummaryMsgTokens = 0;
+  let lastSummaryAtTurn = -1;
+
+  const BASE_OVERHEAD = 3; // priming tokens
 
   for (let turn = 0; turn < numTurns; turn++) {
-    const historyMessages = allMessages.slice(0, turn * 2);
-    const currentUserMessage = allMessages[turn * 2];
+    const historyMsgCount = turn * 2; // individual messages before this turn
+    const currentMsgIdx = turn * 2;   // index of current user message
 
-    // Generate summary at trigger turn
-    if (turn === triggerTurn && !summaryGenerated) {
-      summaryGenerated = true;
-      // Cost of summarization API call:
-      // Input: all messages up to this point (to be summarized)
-      // Output: the summary itself
-      const summaryInputTokens = countMessages([
-        { role: 'system', content: systemPrompt },
-        ...historyMessages,
-      ]);
-      summaryCallCost = summaryInputTokens + summaryTokens;
+    // ── Check if we should generate/regenerate a summary ──────────────────
+
+    const shouldFirstSummary = (turn === FIRST_SUMMARY_TRIGGER_TURN && currentSummaryText === null);
+    const shouldResummary = (currentSummaryText !== null &&
+      turn >= lastSummaryAtTurn + RESUMMARY_TURN_INCREMENT);
+
+    if (shouldFirstSummary || shouldResummary) {
+      const turnsBefore = turn - TURNS_TO_KEEP_UNSUMMARIZED;
+      const msgsBefore = Math.max(0, turnsBefore * 2);
+
+      // Summarization call cost (estimated):
+      // Input = summarization system prompt overhead + messages in older block
+      // We approximate the summarization system prompt as plain token addition
+      const olderBlockTokens = rangeTokens(0, msgsBefore);
+
+      let inputTokens = SUMMARIZATION_SYSTEM_PROMPT_TOKENS + olderBlockTokens + BASE_OVERHEAD;
+
+      // Re-summarization also includes old summary
+      if (shouldResummary && currentSummaryText !== null) {
+        inputTokens += currentSummaryMsgTokens;
+      }
+
+      const summaryCallCost = inputTokens + summaryTokens;
+      totalSummaryCallCost += summaryCallCost;
+
+      currentSummaryText = summaryText;
+      currentSummaryMsgTokens = summaryMsgTokens;
+      lastSummaryAtTurn = turn;
     }
 
-    let contextMessages;
+    // ── Build context token count for this turn ───────────────────────────
 
-    if (!summaryGenerated) {
-      // Pre-trigger: BUG — include ALL messages (unbounded)
-      contextMessages = [
-        { role: 'system', content: systemPrompt },
-        ...historyMessages,
-        currentUserMessage,
-      ];
+    let turnTokens;
+
+    if (currentSummaryText === null) {
+      // PRE-SUMMARY: all history + current message + system prompt
+      // system prompt msg + all history msgs + current msg + priming
+      turnTokens = (4 + systemPromptTokens) + rangeTokens(0, historyMsgCount) +
+        msgTokens[currentMsgIdx] + BASE_OVERHEAD;
     } else {
-      // Post-trigger: summary + last 40 messages
-      const recentMessages = historyMessages.slice(-KEEP_RECENT_MESSAGES);
-      const summarySystemMsg = `Previous conversation summary:\n${summaryText}`;
-
-      contextMessages = [
-        { role: 'system', content: systemPrompt },
-        { role: 'system', content: summarySystemMsg },
-        ...recentMessages,
-        currentUserMessage,
-      ];
+      // POST-SUMMARY: system + summary + last KEEP_RECENT_MESSAGES messages + current
+      const recentStart = Math.max(0, historyMsgCount - KEEP_RECENT_MESSAGES);
+      turnTokens = (4 + systemPromptTokens) +  // system prompt msg
+        currentSummaryMsgTokens +               // summary system msg
+        rangeTokens(recentStart, historyMsgCount) + // last 40 msgs
+        msgTokens[currentMsgIdx] +              // current user msg
+        BASE_OVERHEAD;
     }
 
-    const turnTokens = countMessages(contextMessages);
     tokensPerTurn.push(turnTokens);
     totalTokens += turnTokens;
   }
 
-  // Add one-time summarization call cost to total
-  totalTokens += summaryCallCost;
+  totalTokens += totalSummaryCallCost;
 
   const cumulativeTokensByTurn = [];
   let runningTotal = 0;
@@ -105,44 +149,53 @@ function simulate(systemPrompt, allMessages, config = {}) {
   }
 
   return {
-    strategyName: `${STRATEGY_NAME}-trigger${triggerTurn}-${summaryStyle}`,
+    strategyName: STRATEGY_NAME,
     tokensPerTurn,
     totalTokens,
     cumulativeTokensByTurn,
-    summaryCallCost,
+    summaryCallCost: totalSummaryCallCost,
     summaryTokens,
     config: {
-      triggerTurn,
-      summaryTokens,
-      summaryStyle,
+      firstSummaryTriggerTurn: FIRST_SUMMARY_TRIGGER_TURN,
+      resummaryTurnIncrement: RESUMMARY_TURN_INCREMENT,
+      turnsToKeepUnsummarized: TURNS_TO_KEEP_UNSUMMARIZED,
       keepRecentMessages: KEEP_RECENT_MESSAGES,
-      description: `Current Langua: system + summary (${summaryStyle}) + last 40 msgs, triggered at turn ${triggerTurn}`,
+      summaryTokens,
+      description: `Real Langua: unbounded until turn ${FIRST_SUMMARY_TRIGGER_TURN}, then system+summary+last${KEEP_RECENT_MESSAGES}msgs, re-summarize every ${RESUMMARY_TURN_INCREMENT} turns`,
     },
   };
 }
 
 /**
- * Model the "no summary" path: ALL messages included forever (the bug).
- * This is what happens when no summarization has been triggered.
+ * Model the "no summary" path: ALL messages, unbounded, forever.
+ * Uses incremental token counting for O(n) performance.
  */
 function simulateNoSummaryPath(systemPrompt, allMessages) {
+  const numTurns = Math.floor(allMessages.length / 2);
+
+  const msgTokens = precomputeMessageTokens(allMessages);
+  const systemPromptTokens = countTokens(systemPrompt);
+
+  // Cumulative sums
+  const cumMsg = new Array(msgTokens.length + 1).fill(0);
+  for (let i = 0; i < msgTokens.length; i++) {
+    cumMsg[i + 1] = cumMsg[i] + msgTokens[i];
+  }
+
+  const BASE_OVERHEAD = 3;
   const tokensPerTurn = [];
   let totalTokens = 0;
 
-  const numTurns = Math.floor(allMessages.length / 2);
-
   for (let turn = 0; turn < numTurns; turn++) {
-    const historyMessages = allMessages.slice(0, turn * 2);
-    const currentUserMessage = allMessages[turn * 2];
+    const historyMsgCount = turn * 2;
+    const currentMsgIdx = turn * 2;
 
-    // No management at all — ALL messages sent every turn
-    const contextMessages = [
-      { role: 'system', content: systemPrompt },
-      ...historyMessages,
-      currentUserMessage,
-    ];
+    // All history + current + system prompt
+    const turnTokens = (4 + systemPromptTokens) +
+      cumMsg[historyMsgCount] +
+      msgTokens[currentMsgIdx] +
+      BASE_OVERHEAD;
 
-    const turnTokens = countMessages(contextMessages);
     tokensPerTurn.push(turnTokens);
     totalTokens += turnTokens;
   }
@@ -161,9 +214,23 @@ function simulateNoSummaryPath(systemPrompt, allMessages) {
     cumulativeTokensByTurn,
     summaryCallCost: 0,
     config: {
-      description: 'Current Langua BUG: no summary triggered — ALL messages sent every turn (unbounded)',
+      description: 'Real Langua BUG: no summary triggered (< turn 50) — ALL messages sent every turn (unbounded)',
     },
   };
+}
+
+/**
+ * Generate summary text of approximately the target token count.
+ */
+function generateFixedSummaryText(targetTokens) {
+  const base = 'The learner has been studying Spanish with focus on grammar and vocabulary. Topics covered include verb conjugations, subjunctive mood, reflexive verbs, and ser/estar distinction. The learner showed progress in understanding agreement rules and has been encouraged to practice with native content. Key vocabulary and patterns were reviewed.';
+  let text = base;
+  let iters = 0;
+  while (countTokens(text) < targetTokens - 20 && iters < 50) {
+    text += ' ' + base;
+    iters++;
+  }
+  return text;
 }
 
 module.exports = { simulate, simulateNoSummaryPath, STRATEGY_NAME };
